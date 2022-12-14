@@ -26,7 +26,7 @@ if 'Linux' in platform.system():
 setup(
   name="cyfusion",
   cmdclass= {'build_ext': build_ext},
-  ext_modules=[
+  ext_modules=cythonize([
     Extension('cyfusion',
       ['cyfusion.pyx'],
       language='c++',
@@ -36,5 +36,5 @@ setup(
       extra_compile_args=extra_compile_args,
       extra_link_args=extra_link_args
     )
-  ]
+  ])
 )

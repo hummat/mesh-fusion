@@ -23,8 +23,10 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-cmake_minimum_required(VERSION 2.8)
-set(CMAKE_CXX_STANDARD 11)
+project(fusion_gpu)
+
+cmake_minimum_required(VERSION 3.22.1)
+set(CMAKE_CXX_STANDARD 14)
 
 # set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_BUILD_TYPE Release)
@@ -32,16 +34,13 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse -msse2 -msse3 -msse4.2 -fPIC")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse -msse2 -msse3 -msse4.2 -fPIC")
 
 find_package(CUDA 11.4 REQUIRED)
-set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};-std=c++11")
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};-std=c++14")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_FORCE_INLINES -Wall")
 
 set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS}; -gencode=arch=compute_75,code=sm_75")
 set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS}; -gencode=arch=compute_75,code=compute_75")
 
-set(FUSION_GPU_SRC
-  fusion.cu
-  fusion_zach_tvl1.cu
-)
+set(FUSION_GPU_SRC fusion.cu fusion_zach_tvl1.cu)
 
 cuda_add_library(fusion_gpu SHARED ${FUSION_GPU_SRC})
 target_link_libraries(fusion_gpu ${CUDA_LIBRARIES})
