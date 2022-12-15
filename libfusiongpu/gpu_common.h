@@ -153,7 +153,7 @@ inline void views_to_gpu(const Views& views_cpu, Views& views_gpu, bool alloc) {
   views_gpu.rows_ = views_cpu.rows_;
   views_gpu.cols_ = views_cpu.cols_;
 
-  printf("    views_to_gpu with %dx%dx%d\n", views_gpu.n_views_, views_gpu.rows_, views_gpu.cols_);
+  if(DEBUG) { printf("    views_to_gpu with %dx%dx%d\n", views_gpu.n_views_, views_gpu.rows_, views_gpu.cols_); }
   int N = views_cpu.n_views_ * views_cpu.rows_ * views_cpu.cols_;
   if(alloc) {
     views_gpu.depthmaps_ = device_malloc<float>(N);
@@ -194,7 +194,7 @@ inline void volume_alloc_like_gpu(const Volume& vol_cpu, Volume& vol_gpu) {
   vol_gpu.height_ = vol_cpu.height_;
   vol_gpu.width_ = vol_cpu.width_;
   int N = vol_cpu.channels_ * vol_cpu.depth_ * vol_cpu.height_ * vol_cpu.width_;
-  printf("  volume_alloc_like_gpu gpu memory for volume %dx%dx%dx%d\n", vol_gpu.channels_, vol_gpu.depth_, vol_gpu.height_, vol_gpu.width_);
+  if(DEBUG) { printf("  volume_alloc_like_gpu gpu memory for volume %dx%dx%dx%d\n", vol_gpu.channels_, vol_gpu.depth_, vol_gpu.height_, vol_gpu.width_); }
   vol_gpu.data_ = device_malloc<float>(N);
 }
 
@@ -204,7 +204,7 @@ inline void volume_alloc_gpu(int channels, int depth, int height, int width, Vol
   vol_gpu.height_ = height;
   vol_gpu.width_ = width;
   int N = channels * depth * height * width;
-  printf("  volume_alloc_gpu gpu memory for volume %dx%dx%dx%d\n", vol_gpu.channels_, vol_gpu.depth_, vol_gpu.height_, vol_gpu.width_);
+  if(DEBUG) { printf("  volume_alloc_gpu gpu memory for volume %dx%dx%dx%d\n", vol_gpu.channels_, vol_gpu.depth_, vol_gpu.height_, vol_gpu.width_); }
   vol_gpu.data_ = device_malloc<float>(N);
 }
 

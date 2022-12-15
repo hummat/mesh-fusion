@@ -1,13 +1,14 @@
 import os
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Optional, Union, Iterator
 from pathlib import Path
 import contextlib
 from argparse import ArgumentParser
 from joblib import Parallel, delayed
 import math
-import time
+from time import time
+import logging
 
 from tqdm import tqdm
 import trimesh
@@ -17,10 +18,15 @@ import mcubes
 import pyrender
 import pymeshlab
 from scipy import ndimage
+from scipy.spatial.transform import Rotation
 from PIL import Image
 
 import librender
 import libfusiongpu as libfusion
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def get_points(n_views: int = 100) -> np.ndarray:
@@ -43,6 +49,7 @@ def get_points(n_views: int = 100) -> np.ndarray:
 
     return np.array(points)
 
+
 def get_views(points: np.ndarray) -> List[np.ndarray]:
     """Generate a set of views to generate depth maps from."""
     Rs = []
@@ -59,8 +66,9 @@ def get_views(points: np.ndarray) -> List[np.ndarray]:
 
     return Rs
 
+
 @contextlib.contextmanager
-def tqdm_joblib(tqdm_object):
+def tqdm_joblib(tqdm_object: tqdm):
     def tqdm_print_progress(self):
         if self.n_completed_tasks > tqdm_object.n:
             n_completed = self.n_completed_tasks - tqdm_object.n
@@ -76,41 +84,74 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def convert(path: Path, args: Any):
-    ms = pymeshlab.MeshSet()
-    ms.load_new_mesh(str(path))
-    ms.save_current_mesh(file_name=str(path).replace(args.in_format, args.out_format),
-                         save_vertex_color=False,
-                         save_vertex_coord=False,
-                         save_face_color=False,
-                         save_polygonal=False)
+def resolve_out_path(in_path: Path,
+                     in_dir: Path,
+                     out_format: str,
+                     out_dir: Optional[Path] = None) -> Path:
+    in_path = in_path.expanduser().resolve()
+    if out_dir is not None:
+        in_dir = in_dir.expanduser().resolve()
+        out_dir = out_dir.expanduser().resolve()
+        return out_dir / in_path.relative_to(in_dir).with_suffix(out_format)
+    return in_path.with_suffix(out_format)
 
 
+def load(in_path: Path, method: str = "pymeshlab") -> Trimesh:
+    if method == "trimesh":
+        return trimesh.load(in_path,
+                            force="mesh",
+                            process=False,
+                            validate=False)
+    elif method == "pymeshlab":
+        ms = pymeshlab.MeshSet()
+        ms.load_new_mesh(str(in_path))
+        return Trimesh(vertices=ms.current_mesh().vertex_matrix(),
+                       faces=ms.current_mesh().face_matrix(),
+                       process=False,
+                       validate=False)
+    else:
+        raise ValueError(f"Unknown method '{method}'.")
 
-def scale(path: Path, args: Any) -> Trimesh:
-    mesh = trimesh.load(str(path).replace(args.in_format, args.out_format), process=False)
-    mesh.apply_scale(1.0 / mesh.scale)
-    mesh.apply_translation(-mesh.bounds.mean(axis=0))
-    mesh.apply_scale(1.0 + args.padding)
-    return mesh
+
+def normalize(mesh: Trimesh,
+              translation: Optional[Union[Tuple[float, float, float], np.ndarray]] = None,
+              scale: Optional[Union[float, Tuple[float, float, float], np.ndarray]] = None,
+              padding: float = 0) -> Tuple[Trimesh, np.ndarray, float]:
+    if translation is None:
+        translation = -mesh.bounds.mean(axis=0)
+    if scale is None:
+        max_extents = mesh.extents.max()
+        # scale = 1 / (max_extents + 2 * padding * max_extents)
+        scale = (1 - padding) / max_extents
+
+    mesh.apply_translation(translation)
+    mesh.apply_scale(scale)
+
+    return mesh, translation, scale
 
 
-def render(mesh: Trimesh, args: any) -> List[np.ndarray]:
-    renderer = pyrender.OffscreenRenderer(args.width, args.height)
-    camera = pyrender.IntrinsicsCamera(args.fx, args.fy, args.cx, args.cy, znear=args.znear, zfar=args.zfar)
+def render(mesh: Trimesh,
+           rotations: List[np.ndarray],
+           resolution: int,
+           width: int,
+           height: int,
+           fx: float,
+           fy: float,
+           cx: float,
+           cy: float,
+           znear: float,
+           zfar: float,
+           offset: float = 0,
+           erode: bool = True) -> List[np.ndarray]:
+    renderer = pyrender.OffscreenRenderer(width, height)
+    camera = pyrender.IntrinsicsCamera(fx, fy, cx, cy, znear, zfar)
+    rot_x_180 = Rotation.from_euler('x', 180, degrees=True).as_matrix()
 
     depth_maps = list()
-    for R in get_views(get_points(args.n_views)):
-        """
-        vertices = R.dot(mesh.vertices.astype(np.float64).T)
-        vertices[2, :] += 1
-        faces = mesh.faces.astype(np.float64)
-        """
-
+    for R in rotations:
+        R_pyrender = rot_x_180 @ R
         trafo = np.eye(4)
-        trafo[:3, 0] = R[:3, 0]
-        trafo[:3, 1] = -R[:3, 1]
-        trafo[:3, 2] = R[:3, 2]
+        trafo[:3, :3] = R_pyrender
         trafo[:3, 3] = np.array([0, 0, -1])
         
         mesh_t = mesh.copy()
@@ -121,85 +162,176 @@ def render(mesh: Trimesh, args: any) -> List[np.ndarray]:
         scene.add(camera)
 
         depth = renderer.render(scene, flags=pyrender.RenderFlags.DEPTH_ONLY)
-        depth[depth == 0] = args.zfar 
-
-        """
-        render_intrinsics = np.array([
-            args.fx,
-            args.fy,
-            args.cx,
-            args.cy
-        ], dtype=float)
-        znf = np.array([args.znear, args.zfar], dtype=float)
-        image_size = np.array([args.height, args.width], dtype=np.int32)
-
-        faces += 1
-        depth, mask, img = librender.render(vertices.copy(), faces.T.copy(), render_intrinsics, znf, image_size)
-        """
-
-        # print(depth.shape, depth.min(), depth.max(), depth.mean())
-        # Image.fromarray(((depth / depth.max()) * 255).astype(np.uint8)).convert('L').save('depth_new.png')
-        # time.sleep(100)
+        depth[depth == 0] = zfar 
         
-        depth -= 1.5 * (1 / args.resolution)
-        depth = ndimage.grey_erosion(depth, size=(3, 3))
+        # Optionally thicken object by offsetting and eroding the depth maps.
+        depth -= offset * (1 / resolution)
+        if erode:
+            depth = ndimage.grey_erosion(depth, size=(3, 3))
         depth_maps.append(depth)
 
     renderer.delete()
     return depth_maps
 
 
-def fuse(depth_maps: List[np.ndarray], args: Any) -> np.ndarray:
-    Ks = np.array([[args.fx, 0, args.cx],
-                   [0, args.fy, args.cy],
+def fuse(depth_maps: List[np.ndarray],
+         rotations: List[np.ndarray],
+         resolution: int,
+         fx: float,
+         fy: float,
+         cx: float,
+         cy: float) -> np.ndarray:
+    Ks = np.array([[fx, 0, cx],
+                   [0, fy, cy],
                    [0, 0, 1]]).reshape((1, 3, 3))
 
     Ks = np.repeat(Ks, len(depth_maps), axis=0).astype(np.float32)
-    Rs = np.array(get_views(get_points(args.n_views))).astype(np.float32)
+    Rs = np.array(rotations).astype(np.float32)
     Ts = np.array([np.array([0, 0, 1]) for _ in range(len(Rs))]).astype(np.float32)
     depth_maps = np.array(depth_maps).astype(np.float32)
+    voxel_size = 1 / resolution
 
     views = libfusion.PyViews(depth_maps, Ks, Rs, Ts)
-    truncation_factor = 10 * (1 / args.resolution)
-    tsdf = libfusion.tsdf_gpu(views, args.resolution, args.resolution, args.resolution, 1 / args.resolution, truncation_factor, False)
-    tsdf = np.transpose(tsdf[0], [2, 1, 0])
-
+    tsdf = libfusion.tsdf_gpu(views,
+                              resolution,
+                              resolution,
+                              resolution,
+                              voxel_size,
+                              10 * voxel_size,
+                              False)[0].transpose((2, 1, 0))
     return tsdf
 
 
-def extract(path: Path, tsdf: np.ndarray, args: Any) -> np.ndarray:
-    tsdf = np.pad(tsdf, 1, 'constant', constant_values=1e6)
-
+def extract(tsdf: np.ndarray, resolution: int) -> Trimesh:
+    tsdf = np.pad(tsdf, 1, "constant", constant_values=1e6)
     vertices, triangles = mcubes.marching_cubes(-tsdf, 0)
 
     vertices -= 1
-    vertices /= args.resolution
+    vertices /= resolution
     vertices -= 0.5
 
-    print(Trimesh(vertices=vertices, faces=triangles))
-    print(str(path).replace(args.in_format, args.out_format))
-    mcubes.export_off(vertices, triangles, str(path).replace(args.in_format, args.out_format))
+    return Trimesh(vertices=vertices, faces=triangles, process=False, validate=False)
 
 
-def clean():
-    pass
+def process(mesh: Trimesh, script_paths: Iterator[Path]) -> Trimesh:
+    ms = pymeshlab.MeshSet()
+    pymesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
+    ms.add_mesh(pymesh)
+
+    if not script_paths:
+        return ms
+
+    for script_path in script_paths:
+        logger.debug(f"\tprocess: Applying script {script_path}.")
+        ms.load_filter_script(str(script_path))
+        ms.apply_filter_script()
+
+    return Trimesh(vertices=ms.current_mesh().vertex_matrix(),
+                   faces=ms.current_mesh().face_matrix(),
+                   process=False,
+                   validate=False)
 
 
-def run(path: Path, args: Any):
-    convert(path, args)
-    mesh = scale(path, args)
-    depth_maps = render(mesh, args)
-    tsdf = fuse(depth_maps, args)
-    extract(path, tsdf, args)
-    clean()
+def save(mesh: Union[Trimesh, pymeshlab.MeshSet, pymeshlab.Mesh],
+         path: Path,
+         precision: int = 32) -> None:
+    if isinstance(mesh, Trimesh):
+        if precision == 16:
+            precision = np.float16
+        elif precision == 32:
+            precision = np.float32
+        elif precision == 64:
+            precision = np.float64
+        else:
+            raise ValueError(f"Invalid precision: {precision}.")
+        precision = np.finfo(precision).precision
+        mesh.export(path, digits=precision)
+    elif isinstance(mesh, (pymeshlab.MeshSet, pymeshlab.Mesh)):
+        ms = mesh
+        if isinstance(mesh, pymeshlab.Mesh):
+            ms = pymeshlab.MeshSet()
+            ms.add_mesh(mesh)
+        ms.save_current_mesh(file_name=str(path),
+                             save_vertex_color=False,
+                             save_vertex_coord=False,
+                             save_face_color=False,
+                             save_polygonal=True)
+    else:
+        raise ValueError(f"Unsupported mesh type '{type(mesh)}'.")
+
+
+def run(in_path: Path, args: Any) -> None:
+    start = time()
+    logger.debug(f"Processing file {in_path}:")
+    try:
+        restart = time()
+        mesh = load(in_path)
+        logger.debug(f"Loaded mesh in {time() - restart:.2f}s.")
+
+        restart = time()
+        mesh, translation, scale = normalize(mesh, padding=args.padding)
+        logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
+
+        restart = time()
+        rotations = get_views(get_points(args.n_views))
+        logger.debug(f"Generated rotations in {time() - restart:.2f}s.")
+
+        restart = time()
+        depth_maps = render(mesh,
+                            rotations,
+                            args.resolution,
+                            args.width,
+                            args.height,
+                            args.fx,
+                            args.fy,
+                            args.cx,
+                            args.cy,
+                            args.znear,
+                            args.zfar,
+                            args.depth_offset,
+                            args.erode)
+        logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
+
+        restart = time()
+        tsdf = fuse(depth_maps,
+                    rotations,
+                    args.resolution,
+                    args.fx,
+                    args.fy,
+                    args.cx,
+                    args.cy)
+        logger.debug(f"Fused depth maps in {time() - restart:.2f}s.")
+
+        restart = time()
+        mesh = extract(tsdf, args.resolution)
+        logger.debug(f"Extracted {mesh} in {time() - restart:.2f}s.")
+
+        restart = time()
+        mesh = process(mesh, sorted(args.script_dir.expanduser().resolve().glob("*.mlx")))
+        logger.debug(f"Filtered {mesh} (watertight: {mesh.is_watertight}) in {time() - restart:.2f}s.")
+
+        restart = time()
+        mesh, _, _ = normalize(mesh, translation=-translation * 1 / scale, scale=1 / scale)
+        logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
+
+        restart = time()
+        out_path = resolve_out_path(in_path, args.in_dir, args.out_format, args.out_dir)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save(mesh, out_path, args.precision)
+        logger.debug(f"Saved mesh in {time() - restart:.2f}s.")
+    except Exception as e:
+        logger.exception(e)
+    logger.debug(f"Runtime: {time() - start:.2f}s.\n")
 
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--in_dir", type=str, help="Path to input directory.")
-    parser.add_argument("--out_dir", type=str, help="Path to output directory.")
-    parser.add_argument("--in_format", type=str, default="obj", help="Input file format.")
-    parser.add_argument("--out_format", type=str, default="off", help="Output file format.")
+    parser.add_argument("--in_dir", type=Path, required=True, help="Path to input directory.")
+    parser.add_argument("--out_dir", type=Path, help="Path to output directory.")
+    parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
+    parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
+    parser.add_argument("--script_dir", type=Path, default="meshlab_filter_scripts",
+                        help="Path to directory containing MeshLab scripts.")
     parser.add_argument("--width", type=int, default=640, help="Width of the depth map.")
     parser.add_argument("--height", type=int, default=480, help="Height of the depth map.")
     parser.add_argument("--fx", type=float, default=640, help="Focal length in x.")
@@ -210,12 +342,24 @@ def main():
     parser.add_argument("--zfar", type=float, default=1.75, help="Far clipping plane.")
     parser.add_argument("--padding", type=float, default=0.1, help="Relative padding applied on each side.")
     parser.add_argument("--resolution", type=int, default=255, help="Resolution of the TSDF fusion voxel grid.")
+    parser.add_argument("--depth_offset", type=float, default=0, help="Thicken object through offsetting of rendered depth maps.")
+    parser.add_argument("--erode", action="store_true", help="Erode rendered depth maps to thicken thin structures.")
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of parallel jobs.")
     parser.add_argument("--n_views", type=int, default=100, help="Number of views to render.")
+    parser.add_argument("--precision", type=int, default=32, choices=[16, 32, 64], help="Data precision.")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
 
-    files = sorted(Path(args.in_dir).rglob(f"*.{args.in_format}"))
-    with tqdm_joblib(tqdm(desc="Mesh Fusion", total=len(files))):
+    logging.getLogger("trimesh").setLevel(logging.ERROR)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    in_dir = args.in_dir.expanduser().resolve()
+    logger.debug(f"Globbing paths from {in_dir}.")
+    files = sorted(in_dir.rglob(f"*{args.in_format}"))
+
+    progress = tqdm(desc="Mesh Fusion", total=len(files), disable=args.verbose)
+    with tqdm_joblib(progress):
         Parallel(n_jobs=args.n_jobs)(delayed(run)(file, args) for file in files)
 
 
