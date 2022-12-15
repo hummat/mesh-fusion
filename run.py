@@ -21,7 +21,6 @@ from scipy import ndimage
 from scipy.spatial.transform import Rotation
 from PIL import Image
 
-import librender
 import libfusiongpu as libfusion
 
 
@@ -263,6 +262,14 @@ def save(mesh: Union[Trimesh, pymeshlab.MeshSet, pymeshlab.Mesh],
 def run(in_path: Path, args: Any) -> None:
     start = time()
     logger.debug(f"Processing file {in_path}:")
+
+    out_path = resolve_out_path(in_path, args.in_dir, args.out_format, args.out_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and not args.overwrite:
+        logger.debug(f"File {out_path} already exists. Skipping.")
+        return
+
     try:
         restart = time()
         mesh = load(in_path)
@@ -315,8 +322,6 @@ def run(in_path: Path, args: Any) -> None:
         logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
 
         restart = time()
-        out_path = resolve_out_path(in_path, args.in_dir, args.out_format, args.out_dir)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
         save(mesh, out_path, args.precision)
         logger.debug(f"Saved mesh in {time() - restart:.2f}s.")
     except Exception as e:
@@ -347,6 +352,7 @@ def main():
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of parallel jobs.")
     parser.add_argument("--n_views", type=int, default=100, help="Number of views to render.")
     parser.add_argument("--precision", type=int, default=32, choices=[16, 32, 64], help="Data precision.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
 
