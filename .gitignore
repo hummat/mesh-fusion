@@ -6,3 +6,4 @@ libfusiongpu/cyfusion.cpp
 libfusioncpu/cyfusion.cpp
 librender/pyrender.cpp
 libmcubes/mcubes.cpp
+.idea
