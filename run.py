@@ -137,8 +137,8 @@ def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
             translation = -mesh.bounds.mean(axis=0)
         if scale is None:
             max_extents = mesh.extents.max()
-            # scale = 1 / (max_extents + 2 * padding * max_extents)
-            scale = (1 - padding) / max_extents
+            scale = 1 / (max_extents + 2 * padding * max_extents)
+            # scale = (1 - padding) / max_extents
 
         mesh.apply_translation(translation)
         mesh.apply_scale(scale)
@@ -155,8 +155,8 @@ def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
             if scale is None:
                 extents = bounds.ptp(axis=0)
                 max_extents = extents.max()
-                # scale = 1 / (max_extents + 2 * padding * max_extents)
-                scale = (1 - padding) / max_extents
+                scale = 1 / (max_extents + 2 * padding * max_extents)
+                # scale = (1 - padding) / max_extents
 
         mesh["vertices"] += translation
         mesh["vertices"] *= scale
@@ -183,7 +183,7 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     camera = pyrender.IntrinsicsCamera(fx, fy, cx, cy, znear, zfar)
     rot_x_180 = Rotation.from_euler('x', 180, degrees=True).as_matrix()
 
-    depth_maps = list()
+    depthmaps = list()
     for R in rotations:
         R_pyrender = rot_x_180 @ R
 
@@ -217,13 +217,13 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
         depth -= offset * (1 / resolution)
         if erode:
             depth = ndimage.grey_erosion(depth, size=(3, 3))
-        depth_maps.append(depth)
+        depthmaps.append(depth)
 
     renderer.delete()
-    return depth_maps
+    return depthmaps
 
 
-def fuse(depth_maps: List[np.ndarray],
+def fuse(depthmaps: List[np.ndarray],
          rotations: List[np.ndarray],
          resolution: int,
          fx: float,
@@ -234,20 +234,20 @@ def fuse(depth_maps: List[np.ndarray],
                    [0, fy, cy],
                    [0, 0, 1]]).reshape((1, 3, 3))
 
-    Ks = np.repeat(Ks, len(depth_maps), axis=0).astype(np.float32)
+    Ks = np.repeat(Ks, len(depthmaps), axis=0).astype(np.float32)
     Rs = np.array(rotations).astype(np.float32)
     Ts = np.array([np.array([0, 0, 1]) for _ in range(len(Rs))]).astype(np.float32)
-    depth_maps = np.array(depth_maps).astype(np.float32)
+    depthmaps = np.array(depthmaps).astype(np.float32)
     voxel_size = 1 / resolution
 
-    views = libfusion.PyViews(depth_maps, Ks, Rs, Ts)
+    views = libfusion.PyViews(depthmaps, Ks, Rs, Ts)
     tsdf = libfusion.tsdf_gpu(views,
-                              resolution,
-                              resolution,
-                              resolution,
-                              voxel_size,
-                              10 * voxel_size,
-                              False)[0].transpose((2, 1, 0))
+                              depth=resolution,
+                              height=resolution,
+                              width=resolution,
+                              vx_size=voxel_size,
+                              truncation=10 * voxel_size,
+                              unknown_is_free=False)[0].transpose((2, 1, 0))
     return tsdf
 
 
@@ -404,23 +404,23 @@ def run(in_path: Path, args: Any):
         logger.debug(f"Generated rotations in {time() - restart:.2f}s.")
 
         restart = time()
-        depth_maps = render(mesh,
-                            rotations,
-                            args.resolution,
-                            args.width,
-                            args.height,
-                            args.fx,
-                            args.fy,
-                            args.cx,
-                            args.cy,
-                            args.znear,
-                            args.zfar,
-                            args.depth_offset,
-                            args.erode)
+        depthmaps = render(mesh,
+                           rotations,
+                           args.resolution,
+                           args.width,
+                           args.height,
+                           args.fx,
+                           args.fy,
+                           args.cx,
+                           args.cy,
+                           args.znear,
+                           args.zfar,
+                           args.depth_offset,
+                           args.erode)
         logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
 
         restart = time()
-        tsdf = fuse(depth_maps,
+        tsdf = fuse(depthmaps,
                     rotations,
                     args.resolution,
                     args.fx,
