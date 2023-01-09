@@ -8,7 +8,7 @@ import contextlib
 from argparse import ArgumentParser
 from joblib import Parallel, delayed
 import math
-from time import time
+from time import time, sleep
 import logging
 import tracemalloc
 import linecache
@@ -22,6 +22,7 @@ import pyrender
 import pymeshlab
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
+from PIL import Image
 
 import libfusiongpu as libfusion
 
@@ -177,8 +178,10 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
            cy: float,
            znear: float,
            zfar: float,
-           offset: float = 0,
-           erode: bool = True) -> List[np.ndarray]:
+           offset: float = 1.5,
+           erode: bool = True,
+           flip_faces: bool = False,
+           show: bool = False) -> List[np.ndarray]:
     renderer = pyrender.OffscreenRenderer(width, height)
     camera = pyrender.IntrinsicsCamera(fx, fy, cx, cy, znear, zfar)
     rot_x_180 = Rotation.from_euler('x', 180, degrees=True).as_matrix()
@@ -194,12 +197,19 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
 
             mesh_copy = mesh.copy()
             mesh_copy.apply_transform(trafo)
+
+            if flip_faces:
+                mesh_copy.invert()
+
             pyrender_mesh = pyrender.Mesh.from_trimesh(mesh_copy)
         elif isinstance(mesh, dict):
             vertices = mesh["vertices"].copy()
             vertices = vertices @ R_pyrender.T
             vertices[:, 2] -= 1
             faces = mesh["faces"].copy()
+
+            if flip_faces:
+                faces = [[face[2], face[1], face[0]] for face in faces]
 
             primitives = [pyrender.Primitive(positions=vertices, indices=faces)]
             pyrender_mesh = pyrender.Mesh(primitives=primitives)
@@ -211,6 +221,11 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
         scene.add(camera)
 
         depth = renderer.render(scene, flags=pyrender.RenderFlags.DEPTH_ONLY)
+
+        if show:
+            Image.fromarray(((depth / depth.max()) * 256).astype(np.uint8)).convert('L').show()
+            sleep(1)
+
         depth[depth == 0] = zfar
 
         # Optionally thicken object by offsetting and eroding the depth maps.
@@ -416,7 +431,8 @@ def run(in_path: Path, args: Any):
                            args.znear,
                            args.zfar,
                            args.depth_offset,
-                           args.erode)
+                           args.erode,
+                           args.flip_faces)
         logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
 
         restart = time()
@@ -482,6 +498,7 @@ def main():
     parser.add_argument("--n_views", type=int, default=100, help="Number of views to render.")
     parser.add_argument("--precision", type=int, default=32, choices=[16, 32, 64], help="Data precision.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files.")
+    parser.add_argument("--flip_faces", action="store_true", help="Flip faces (i.e. invert normals) of the mesh.")
     parser.add_argument("--use_trimesh", action="store_true", help="Use trimesh for loading and saving meshes.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
