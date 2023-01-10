@@ -198,20 +198,22 @@ def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
             mesh_copy = mesh.copy()
             mesh_copy.apply_transform(trafo)
 
+            pyrender_mesh = pyrender.Mesh.from_trimesh(mesh_copy)
+
             if flip_faces:
                 mesh_copy.invert()
-
-            pyrender_mesh = pyrender.Mesh.from_trimesh(mesh_copy)
+                pyrender_mesh = [pyrender_mesh, pyrender.Mesh.from_trimesh(mesh_copy)]
         elif isinstance(mesh, dict):
             vertices = mesh["vertices"].copy()
             vertices = vertices @ R_pyrender.T
             vertices[:, 2] -= 1
             faces = mesh["faces"].copy()
 
-            if flip_faces:
-                faces = [[face[2], face[1], face[0]] for face in faces]
-
             primitives = [pyrender.Primitive(positions=vertices, indices=faces)]
+
+            if flip_faces:
+                primitives.append(pyrender.Primitive(positions=vertices, indices=np.flip(faces, axis=1)))
+
             pyrender_mesh = pyrender.Mesh(primitives=primitives)
         else:
             raise ValueError(f"Unknown mesh type '{type(mesh)}'.")
@@ -432,7 +434,8 @@ def run(in_path: Path, args: Any):
                            args.zfar,
                            args.depth_offset,
                            args.erode,
-                           args.flip_faces)
+                           args.flip_faces,
+                           show=False)
         logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
 
         restart = time()

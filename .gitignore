@@ -7,3 +7,4 @@ libfusioncpu/cyfusion.cpp
 librender/pyrender.cpp
 libmcubes/mcubes.cpp
 .idea
+.python-version
