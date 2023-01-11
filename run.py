@@ -1,3 +1,4 @@
+import gc
 import os
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -482,6 +483,9 @@ def run(in_path: Path, args: Any):
         restart = time()
         save(mesh, out_path, args.precision)
         logger.debug(f"Saved mesh in {time() - restart:.2f}s.")
+
+        del mesh
+        gc.collect()
     except Exception as e:
         logger.exception(e)
     logger.debug(f"Runtime: {time() - start:.2f}s.\n")
