@@ -132,7 +132,7 @@ def load(in_path: Path,
 def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
               translation: Optional[Union[Tuple[float, float, float], np.ndarray]] = None,
               scale: Optional[Union[float, Tuple[float, float, float], np.ndarray]] = None,
-              padding: float = 0) -> Tuple[Union[Trimesh, Dict[str, np.ndarray]], np.ndarray, float]:
+              padding: float = 0.1) -> Tuple[Union[Trimesh, Dict[str, np.ndarray]], np.ndarray, float]:
     if isinstance(mesh, Trimesh):
         if translation is None:
             translation = -mesh.bounds.mean(axis=0)
@@ -479,21 +479,21 @@ def run(in_path: Path, args: Any):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--in_dir", type=Path, required=True, help="Path to input directory.")
+    parser.add_argument("in_dir", type=Path, help="Path to input directory.")
     parser.add_argument("--out_dir", type=Path, help="Path to output directory.")
     parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
     parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
     parser.add_argument("--script_dir", type=Path, help="Path to directory containing MeshLab scripts.")
     parser.add_argument("--width", type=int, default=640, help="Width of the depth map.")
-    parser.add_argument("--height", type=int, default=480, help="Height of the depth map.")
+    parser.add_argument("--height", type=int, default=640, help="Height of the depth map.")
     parser.add_argument("--fx", type=float, default=640, help="Focal length in x.")
     parser.add_argument("--fy", type=float, default=640, help="Focal length in y.")
     parser.add_argument("--cx", type=float, default=320, help="Principal point in x.")
-    parser.add_argument("--cy", type=float, default=240, help="Principal point in y.")
+    parser.add_argument("--cy", type=float, default=320, help="Principal point in y.")
     parser.add_argument("--znear", type=float, default=0.25, help="Near clipping plane.")
     parser.add_argument("--zfar", type=float, default=1.75, help="Far clipping plane.")
     parser.add_argument("--padding", type=float, default=0.1, help="Relative padding applied on each side.")
-    parser.add_argument("--resolution", type=int, default=255, help="Resolution of the TSDF fusion voxel grid.")
+    parser.add_argument("--resolution", type=int, default=256, help="Resolution of the TSDF fusion voxel grid.")
     parser.add_argument("--depth_offset", type=float, default=0,
                         help="Thicken object through offsetting of rendered depth maps.")
     parser.add_argument("--erode", action="store_true", help="Erode rendered depth maps to thicken thin structures.")
@@ -514,6 +514,7 @@ def main():
     in_dir = args.in_dir.expanduser().resolve()
     logger.debug(f"Globbing paths from {in_dir}.")
     files = sorted(in_dir.rglob(f"*{args.in_format}"))
+    logger.debug(f"Found {len(files)} files.")
 
     # tracemalloc.start()
 
