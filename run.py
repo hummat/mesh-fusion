@@ -452,18 +452,28 @@ def run(in_path: Path, args: Any):
         mesh = extract(tsdf, args.resolution, return_type="trimesh" if args.use_trimesh else "dict")
         if args.use_trimesh:
             vertices = mesh.vertices
+            faces = mesh.faces
         else:
             vertices = mesh["vertices"]
-        logger.debug(f"Extracted mesh ({len(vertices)} vertices) in {time() - restart:.2f}s.")
+            faces = mesh["faces"]
+        if len(vertices) == 0 or len(faces) == 0:
+            logger.warning(f"Extracted mesh is empty. Skipping.")
+            return
+        logger.debug(f"Extracted mesh ({len(vertices)} vertices, {len(faces)} faces) in {time() - restart:.2f}s.")
 
         if args.script_dir:
             restart = time()
             mesh = process(mesh, sorted(args.script_dir.expanduser().resolve().glob("*.mlx")))
             if args.use_trimesh:
                 vertices = mesh.vertices
+                faces = mesh.faces
             else:
                 vertices = mesh["vertices"]
-            logger.debug(f"Filtered mesh ({len(vertices)} vertices) in {time() - restart:.2f}s.")
+                faces = mesh["faces"]
+            if len(vertices) == 0 or len(faces) == 0:
+                logger.warning(f"Filtered mesh is empty. Skipping.")
+                return
+            logger.debug(f"Filtered mesh ({len(vertices)} vertices, {len(faces)} faces) in {time() - restart:.2f}s.")
 
         restart = time()
         mesh, _, _ = normalize(mesh, translation=-translation * 1 / scale, scale=1 / scale)
