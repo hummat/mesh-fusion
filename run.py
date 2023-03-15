@@ -434,7 +434,7 @@ def run(in_path: Path, args: Any):
                            args.znear,
                            args.zfar,
                            args.depth_offset,
-                           args.erode,
+                           not args.no_erosion,
                            args.flip_faces,
                            show=False)
         logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
@@ -497,7 +497,8 @@ def main():
     parser.add_argument("--out_dir", type=Path, help="Path to output directory.")
     parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
     parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
-    parser.add_argument("--script_dir", type=Path, help="Path to directory containing MeshLab scripts.")
+    parser.add_argument("--script_dir", type=Path, default="meshlab_filter_scripts",
+                        help="Path to directory containing MeshLab scripts.")
     parser.add_argument("--width", type=int, default=640, help="Width of the depth map.")
     parser.add_argument("--height", type=int, default=640, help="Height of the depth map.")
     parser.add_argument("--fx", type=float, default=640, help="Focal length in x.")
@@ -508,12 +509,13 @@ def main():
     parser.add_argument("--zfar", type=float, default=1.75, help="Far clipping plane.")
     parser.add_argument("--padding", type=float, default=0.1, help="Relative padding applied on each side.")
     parser.add_argument("--resolution", type=int, default=256, help="Resolution of the TSDF fusion voxel grid.")
-    parser.add_argument("--depth_offset", type=float, default=0,
+    parser.add_argument("--depth_offset", type=float, default=1.5,
                         help="Thicken object through offsetting of rendered depth maps.")
-    parser.add_argument("--erode", action="store_true", help="Erode rendered depth maps to thicken thin structures.")
+    parser.add_argument("--no_erosion", action="store_true",
+                        help="Do not erode rendered depth maps to thicken thin structures.")
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of parallel jobs.")
     parser.add_argument("--n_views", type=int, default=100, help="Number of views to render.")
-    parser.add_argument("--precision", type=int, default=32, choices=[16, 32, 64], help="Data precision.")
+    parser.add_argument("--precision", type=int, default=16, choices=[16, 32, 64], help="Data precision.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files.")
     parser.add_argument("--flip_faces", action="store_true", help="Flip faces (i.e. invert normals) of the mesh.")
     parser.add_argument("--use_trimesh", action="store_true", help="Use trimesh for loading and saving meshes.")
