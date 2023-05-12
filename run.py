@@ -1,5 +1,6 @@
 import gc
 import os
+from random import shuffle
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
@@ -25,10 +26,32 @@ from scipy import ndimage
 from scipy.spatial.transform import Rotation
 from PIL import Image
 
-import libfusiongpu as libfusion
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+MODES = ["fuse", "carve", "fill"]
+try:
+    import libfusiongpu as libfusion
+except ImportError:
+    logger.warning("Could not import libfusiongpu, falling back to CPU implementation.")
+    try:
+        import libfusioncpu as libfusion
+    except ImportError:
+        logger.warning("Could not import libfusioncpu, 'fuse' mode disabled.")
+        MODES.remove("fuse")
+try:
+    import open3d as o3d
+except ImportError:
+    logger.warning("Could not import Open3D, 'carve' mode disabled.")
+    MODES.remove("carve")
+try:
+    import torch
+    import kaolin
+except ImportError:
+    logger.warning("Could not import PyTorch and/or NVIDIA Kaolin, 'fill' mode disabled.")
+    MODES.remove("fill")
+assert len(MODES) > 0, "No modes available, exiting."
+logger.info(f"Enabled modes: {MODES}")
 
 
 def get_points(n_views: int = 100) -> np.ndarray:
@@ -168,6 +191,77 @@ def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     return mesh, translation, scale
 
 
+def smooth_laplacian(mesh: Union[Trimesh, Dict[str, np.ndarray]], iterations: int = 3) -> Dict[str, np.ndarray]:
+    try:
+        import torch
+        import kaolin
+
+        if isinstance(mesh, Trimesh):
+            vertices, faces = mesh.vertices, mesh.faces
+        else:
+            vertices, faces = mesh["vertices"], mesh["faces"]
+
+        vertices = torch.from_numpy(vertices.astype(np.float32)).cuda()
+        faces = torch.from_numpy(faces.astype(np.int64)).cuda()
+        adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
+        neighbor_num = torch.sparse.sum(adj_sparse, dim=1).to_dense().view(-1, 1)
+        for _ in range(iterations):
+            neighbor_sum = torch.sparse.mm(adj_sparse, vertices)
+            vertices = neighbor_sum / neighbor_num
+
+        return {"vertices": vertices.cpu().numpy(),
+                "faces": faces.cpu().numpy()}
+    except ImportError:
+        raise ImportError("Laplacian smoothing requires Kaolin and PyTorch.")
+
+
+def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
+                    resolution: int = 256,
+                    eps: float = 1e-6,
+                    smoothing_iterations: int = 3) -> Dict[str, np.ndarray]:
+    vertices, faces = get_vertices_and_faces(mesh)
+    torch_vertices = torch.from_numpy(vertices).cuda()
+    torch_faces = torch.from_numpy(faces).cuda()
+
+    voxel = kaolin.ops.conversions.trianglemeshes_to_voxelgrids(torch_vertices.unsqueeze(0),
+                                                                torch_faces,
+                                                                resolution=resolution,
+                                                                origin=torch.zeros((1, 3)).cuda() - 0.5,
+                                                                scale=torch.ones(1).cuda())
+
+    voxel = torch.from_numpy(ndimage.binary_fill_holes(voxel.squeeze(0).cpu().numpy())).unsqueeze(0).cuda()
+    voxel = kaolin.ops.voxelgrid.extract_surface(voxel)
+    odms = kaolin.ops.voxelgrid.extract_odms(voxel)
+    voxel = kaolin.ops.voxelgrid.project_odms(odms)
+
+    odms.cpu()
+    del odms
+    torch.cuda.empty_cache()
+
+    vertices, faces = kaolin.ops.conversions.voxelgrids_to_trianglemeshes(voxel)
+    vertices = vertices[0] / (voxel.size(-1) + 1)
+    vertices -= 0.5
+    faces = faces[0]
+
+    voxel.cpu()
+    del voxel
+    torch.cuda.empty_cache()
+
+    adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
+    neighbor_num = torch.sparse.sum(adj_sparse, dim=1).to_dense().view(-1, 1)
+    for _ in range(smoothing_iterations):
+        neighbor_sum = torch.sparse.mm(adj_sparse, vertices)
+        vertices = neighbor_sum / neighbor_num
+
+    src_min, src_max = vertices.min(0, keepdim=True)[0], vertices.max(0, keepdim=True)[0]
+    tgt_min, tgt_max = torch_vertices.min(0, keepdim=True)[0], torch_vertices.max(0, keepdim=True)[0]
+    vertices = ((vertices - src_min) / (src_max - src_min + eps)) * (tgt_max - tgt_min) + tgt_min
+
+    torch.cuda.empty_cache()
+
+    return {"vertices": vertices.cpu().numpy(), "faces": faces.cpu().numpy()}
+
+
 def render(mesh: Union[Trimesh, Dict[str, np.ndarray]],
            rotations: List[np.ndarray],
            resolution: int,
@@ -269,14 +363,15 @@ def fuse(depthmaps: List[np.ndarray],
     return tsdf
 
 
-def extract(tsdf: np.ndarray,
+def extract(grid: np.ndarray,
+            level: float,
             resolution: int,
             return_type: str = "dict") -> Union[Trimesh, Dict[str, np.ndarray]]:
-    tsdf = np.pad(tsdf, 1, "constant", constant_values=1e6)
-    vertices, triangles = mcubes.marching_cubes(-tsdf, 0)
+    grid = np.pad(grid, 1, "constant", constant_values=-1e6 if grid.min() < 0 else 1e6)
+    vertices, triangles = mcubes.marching_cubes(grid, level)
 
-    vertices -= 1
-    vertices /= resolution
+    vertices -= 1  # Undo padding.
+    vertices /= (resolution - 1)
     vertices -= 0.5
 
     if return_type == "trimesh":
@@ -290,16 +385,19 @@ def extract(tsdf: np.ndarray,
         raise ValueError(f"Unknown return type '{return_type}'.")
 
 
-def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
-            script_paths: Iterator[Path]) -> Union[Trimesh, Dict[str, np.ndarray]]:
+def get_vertices_and_faces(mesh: Union[Trimesh, Dict[str, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
     if isinstance(mesh, Trimesh):
-        vertices = mesh.vertices
-        faces = mesh.faces
+        vertices, faces = mesh.vertices, mesh.faces
     elif isinstance(mesh, dict):
-        vertices = mesh["vertices"]
-        faces = mesh["faces"]
+        vertices, faces = mesh["vertices"], mesh["faces"]
     else:
         raise ValueError(f"Unknown mesh type '{type(mesh)}'.")
+    return vertices, faces
+
+
+def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
+            script_paths: List[Path]) -> Union[Trimesh, Dict[str, np.ndarray]]:
+    vertices, faces = get_vertices_and_faces(mesh)
 
     ms = pymeshlab.MeshSet()
     pymesh = pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces)
@@ -407,56 +505,61 @@ def run(in_path: Path, args: Any):
         mesh = load(in_path,
                     loader="trimesh" if args.use_trimesh else "pymeshlab",
                     return_type="trimesh" if args.use_trimesh else "dict")
-        if args.use_trimesh:
-            vertices = mesh.vertices
-        else:
-            vertices = mesh["vertices"]
+        vertices = get_vertices_and_faces(mesh)[0]
         logger.debug(f"Loaded mesh ({len(vertices)} vertices) in {time() - restart:.2f}s.")
 
         restart = time()
         mesh, translation, scale = normalize(mesh, padding=args.padding)
         logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
 
-        restart = time()
-        rotations = get_views(get_points(args.n_views))
-        logger.debug(f"Generated rotations in {time() - restart:.2f}s.")
+        if args.mode == "fill":
+            restart = time()
+            mesh = kaolin_pipeline(mesh)
+            logger.debug(f"Ran Kaolin pipeline in {time() - restart:.2f}s.")
+        elif args.mode == "fuse":
+            restart = time()
+            rotations = get_views(get_points(args.n_views))
+            logger.debug(f"Generated rotations in {time() - restart:.2f}s.")
 
-        restart = time()
-        depthmaps = render(mesh,
-                           rotations,
-                           args.resolution,
-                           args.width,
-                           args.height,
-                           args.fx,
-                           args.fy,
-                           args.cx,
-                           args.cy,
-                           args.znear,
-                           args.zfar,
-                           args.depth_offset,
-                           not args.no_erosion,
-                           args.flip_faces,
-                           show=False)
-        logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
+            restart = time()
+            depthmaps = render(mesh,
+                               rotations,
+                               args.resolution,
+                               args.width,
+                               args.height,
+                               args.fx,
+                               args.fy,
+                               args.cx,
+                               args.cy,
+                               args.znear,
+                               args.zfar,
+                               args.depth_offset,
+                               not args.no_erosion,
+                               args.flip_faces,
+                               show=False)
+            logger.debug(f"Rendered depth maps in {time() - restart:.2f}s.")
 
-        restart = time()
-        tsdf = fuse(depthmaps,
-                    rotations,
-                    args.resolution,
-                    args.fx,
-                    args.fy,
-                    args.cx,
-                    args.cy)
-        logger.debug(f"Fused depth maps in {time() - restart:.2f}s.")
+            restart = time()
+            tsdf = fuse(depthmaps,
+                        rotations,
+                        args.resolution,
+                        args.fx,
+                        args.fy,
+                        args.cx,
+                        args.cy)
+            logger.debug(f"Fused depth maps in {time() - restart:.2f}s.")
 
-        restart = time()
-        mesh = extract(tsdf, args.resolution, return_type="trimesh" if args.use_trimesh else "dict")
-        if args.use_trimesh:
-            vertices = mesh.vertices
-            faces = mesh.faces
+            restart = time()
+            mesh = extract(grid=-tsdf,
+                           level=0,
+                           resolution=args.resolution,
+                           return_type="trimesh" if args.use_trimesh else "dict")
+        elif args.mode == "carve":
+            raise NotImplementedError("Voxel carving is not implemented yet.")
         else:
-            vertices = mesh["vertices"]
-            faces = mesh["faces"]
+            raise ValueError(f"Invalid mode: {args.mode}.")
+
+        vertices, faces = get_vertices_and_faces(mesh)
         if len(vertices) == 0 or len(faces) == 0:
             logger.warning(f"Extracted mesh is empty. Skipping.")
             return
@@ -465,12 +568,8 @@ def run(in_path: Path, args: Any):
         if args.script_dir:
             restart = time()
             mesh = process(mesh, sorted(args.script_dir.expanduser().resolve().glob("*.mlx")))
-            if args.use_trimesh:
-                vertices = mesh.vertices
-                faces = mesh.faces
-            else:
-                vertices = mesh["vertices"]
-                faces = mesh["faces"]
+
+            vertices, faces = get_vertices_and_faces(mesh)
             if len(vertices) == 0 or len(faces) == 0:
                 logger.warning(f"Filtered mesh is empty. Skipping.")
                 return
@@ -479,6 +578,15 @@ def run(in_path: Path, args: Any):
         restart = time()
         mesh, _, _ = normalize(mesh, translation=-translation * 1 / scale, scale=1 / scale)
         logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
+
+        if args.check_watertight:
+            restart = time()
+            vertices, faces = get_vertices_and_faces(mesh)
+            _mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+            if not _mesh.is_watertight:
+                logger.warning(f"Mesh is not watertight. Skipping.")
+                return
+            logger.debug(f"Checked watertightness in {time() - restart:.2f}s.")
 
         restart = time()
         save(mesh, out_path, args.precision)
@@ -519,6 +627,11 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files.")
     parser.add_argument("--flip_faces", action="store_true", help="Flip faces (i.e. invert normals) of the mesh.")
     parser.add_argument("--use_trimesh", action="store_true", help="Use trimesh for loading and saving meshes.")
+    parser.add_argument("--mode", type=str, default="fuse", choices=["fuse", "carve", "fill"],
+                        help="Apply TSDF fusion, voxel carving or hole filling to the meshes.")
+    parser.add_argument("--filter_only", action="store_true", help="Only applies the provided MeshLab filters.")
+    parser.add_argument("--sort", action="store_true", help="Sort files before processing.")
+    parser.add_argument("--check_watertight", action="store_true", help="Verify that generated mesh is watertight.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
 
@@ -529,7 +642,10 @@ def main():
 
     in_dir = args.in_dir.expanduser().resolve()
     logger.debug(f"Globbing paths from {in_dir}.")
-    files = sorted(in_dir.rglob(f"*{args.in_format}"))
+    files = list(in_dir.rglob(f"*{args.in_format}"))
+    shuffle(files)
+    if args.sort:
+        files = sorted(files)
     logger.debug(f"Found {len(files)} files.")
 
     # tracemalloc.start()
