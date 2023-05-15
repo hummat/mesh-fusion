@@ -414,15 +414,16 @@ def load_scripts(script_dir: Path,
         logger.debug(f"\tload_scripts: Simplifying mesh by {100 * (1 - percentage):.0f}%.")
 
         index = next(i for i, s in enumerate(scripts) if s.name == 'simplify.mlx')
-        script = open(scripts[index], 'r').read()
-        assert 'Simplification: Quadric Edge Collapse Decimation' in script
-        script = script.replace('"Percentage reduction (0..1)" value="0.05"',
-                                f'"Percentage reduction (0..1)" value="{percentage}"')
-        assert f'"Percentage reduction (0..1)" value="{percentage}"' in script
+        with open(scripts[index], 'r') as f:
+            script = f.read()
+            assert 'Simplification: Quadric Edge Collapse Decimation' in script
+            script = script.replace('"Percentage reduction (0..1)" value="0.05"',
+                                    f'"Percentage reduction (0..1)" value="{percentage}"')
+            assert f'"Percentage reduction (0..1)" value="{percentage}"' in script
 
-        scripts[index] = Path(tempfile.mkstemp(suffix=".mlx")[1])
-        scripts[index].write_text(script)
-        logger.debug(f"\tload_scripts: Saved modified simplification script to {scripts[index]}.")
+            scripts[index] = Path(tempfile.mkstemp(suffix=".mlx")[1])
+            scripts[index].write_text(script)
+            logger.debug(f"\tload_scripts: Saved modified simplification script to {scripts[index]}.")
     return scripts
 
 
