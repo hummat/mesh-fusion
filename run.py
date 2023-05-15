@@ -1,6 +1,8 @@
 import gc
 import os
+import sys
 from random import shuffle
+import tempfile
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
@@ -15,13 +17,13 @@ import logging
 import tracemalloc
 import linecache
 
+import pymeshlab
 from tqdm import tqdm
 import trimesh
 from trimesh import Trimesh
 import numpy as np
 import mcubes
 import pyrender
-import pymeshlab
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
 from PIL import Image
@@ -51,7 +53,24 @@ except ImportError:
     logger.warning("Could not import PyTorch and/or NVIDIA Kaolin, 'fill' mode disabled.")
     MODES.remove("fill")
 assert len(MODES) > 0, "No modes available, exiting."
-logger.info(f"Enabled modes: {MODES}")
+logger.debug(f"Enabled modes: {MODES}")
+
+
+@contextlib.contextmanager
+def tqdm_joblib(tqdm_object: tqdm):
+    def tqdm_print_progress(self):
+        if self.n_completed_tasks > tqdm_object.n:
+            n_completed = self.n_completed_tasks - tqdm_object.n
+            tqdm_object.update(n=n_completed)
+
+    original_print_progress = Parallel.print_progress
+    Parallel.print_progress = tqdm_print_progress
+
+    try:
+        yield tqdm_object
+    finally:
+        Parallel.print_progress = original_print_progress
+        tqdm_object.close()
 
 
 def get_points(n_views: int = 100) -> np.ndarray:
@@ -92,23 +111,6 @@ def get_views(points: np.ndarray) -> List[np.ndarray]:
         Rs.append(R)
 
     return Rs
-
-
-@contextlib.contextmanager
-def tqdm_joblib(tqdm_object: tqdm):
-    def tqdm_print_progress(self):
-        if self.n_completed_tasks > tqdm_object.n:
-            n_completed = self.n_completed_tasks - tqdm_object.n
-            tqdm_object.update(n=n_completed)
-
-    original_print_progress = Parallel.print_progress
-    Parallel.print_progress = tqdm_print_progress
-
-    try:
-        yield tqdm_object
-    finally:
-        Parallel.print_progress = original_print_progress
-        tqdm_object.close()
 
 
 def resolve_out_path(in_path: Path,
@@ -191,34 +193,12 @@ def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     return mesh, translation, scale
 
 
-def smooth_laplacian(mesh: Union[Trimesh, Dict[str, np.ndarray]], iterations: int = 3) -> Dict[str, np.ndarray]:
-    try:
-        import torch
-        import kaolin
-
-        if isinstance(mesh, Trimesh):
-            vertices, faces = mesh.vertices, mesh.faces
-        else:
-            vertices, faces = mesh["vertices"], mesh["faces"]
-
-        vertices = torch.from_numpy(vertices.astype(np.float32)).cuda()
-        faces = torch.from_numpy(faces.astype(np.int64)).cuda()
-        adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
-        neighbor_num = torch.sparse.sum(adj_sparse, dim=1).to_dense().view(-1, 1)
-        for _ in range(iterations):
-            neighbor_sum = torch.sparse.mm(adj_sparse, vertices)
-            vertices = neighbor_sum / neighbor_num
-
-        return {"vertices": vertices.cpu().numpy(),
-                "faces": faces.cpu().numpy()}
-    except ImportError:
-        raise ImportError("Laplacian smoothing requires Kaolin and PyTorch.")
-
-
 def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
                     resolution: int = 256,
                     eps: float = 1e-6,
-                    smoothing_iterations: int = 3) -> Dict[str, np.ndarray]:
+                    smoothing_iterations: int = 3,
+                    realign: bool = True,
+                    save_voxel_path: Optional[Path] = None) -> Dict[str, np.ndarray]:
     vertices, faces = get_vertices_and_faces(mesh)
     torch_vertices = torch.from_numpy(vertices).cuda()
     torch_faces = torch.from_numpy(faces).cuda()
@@ -243,19 +223,22 @@ def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     vertices -= 0.5
     faces = faces[0]
 
-    voxel.cpu()
-    del voxel
+    voxel = voxel.squeeze(0).cpu().numpy()
+    if save_voxel_path is not None:
+        np.savez_compressed(str(save_voxel_path), voxel=np.packbits(voxel))
     torch.cuda.empty_cache()
 
-    adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
-    neighbor_num = torch.sparse.sum(adj_sparse, dim=1).to_dense().view(-1, 1)
-    for _ in range(smoothing_iterations):
-        neighbor_sum = torch.sparse.mm(adj_sparse, vertices)
-        vertices = neighbor_sum / neighbor_num
+    if smoothing_iterations > 0:
+        adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
+        neighbor_num = torch.sparse.sum(adj_sparse, dim=1).to_dense().view(-1, 1)
+        for _ in range(smoothing_iterations):
+            neighbor_sum = torch.sparse.mm(adj_sparse, vertices)
+            vertices = neighbor_sum / neighbor_num
 
-    src_min, src_max = vertices.min(0, keepdim=True)[0], vertices.max(0, keepdim=True)[0]
-    tgt_min, tgt_max = torch_vertices.min(0, keepdim=True)[0], torch_vertices.max(0, keepdim=True)[0]
-    vertices = ((vertices - src_min) / (src_max - src_min + eps)) * (tgt_max - tgt_min) + tgt_min
+    if realign:
+        src_min, src_max = vertices.min(0, keepdim=True)[0], vertices.max(0, keepdim=True)[0]
+        tgt_min, tgt_max = torch_vertices.min(0, keepdim=True)[0], torch_vertices.max(0, keepdim=True)[0]
+        vertices = ((vertices - src_min) / (src_max - src_min + eps)) * (tgt_max - tgt_min) + tgt_min
 
     torch.cuda.empty_cache()
 
@@ -385,6 +368,35 @@ def extract(grid: np.ndarray,
         raise ValueError(f"Unknown return type '{return_type}'.")
 
 
+def load_scripts(script_dir: Path,
+                 num_vertices: Optional[int] = None,
+                 min_vertices: int = 20000,
+                 max_vertices: int = 200000) -> List[Path]:
+    scripts = sorted(script_dir.expanduser().resolve().glob("*.mlx"))
+    logger.debug(f"Found {len(scripts)} scripts in {script_dir}.")
+    simplify = any(script.name == 'simplify.mlx' for script in scripts)
+    if simplify and num_vertices is not None:
+        if num_vertices < min_vertices:
+            percentage = 0.5
+        elif num_vertices > max_vertices:
+            percentage = 0.1
+        else:
+            percentage = round(0.5 + (num_vertices - min_vertices) / (max_vertices - min_vertices) * (0.1 - 0.5), 2)
+        logger.debug(f"\tload_scripts: Simplifying mesh by {100 * (1 - percentage):.0f}%.")
+
+        index = next(i for i, s in enumerate(scripts) if s.name == 'simplify.mlx')
+        script = open(scripts[index], 'r').read()
+        assert 'Simplification: Quadric Edge Collapse Decimation' in script
+        script = script.replace('"Percentage reduction (0..1)" value="0.05"',
+                                f'"Percentage reduction (0..1)" value="{percentage}"')
+        assert f'"Percentage reduction (0..1)" value="{percentage}"' in script
+
+        scripts[index] = Path(tempfile.mkstemp(suffix=".mlx")[1])
+        scripts[index].write_text(script)
+        logger.debug(f"\tload_scripts: Saved modified simplification script to {scripts[index]}.")
+    return scripts
+
+
 def get_vertices_and_faces(mesh: Union[Trimesh, Dict[str, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
     if isinstance(mesh, Trimesh):
         vertices, faces = mesh.vertices, mesh.faces
@@ -404,7 +416,7 @@ def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     ms.add_mesh(pymesh)
 
     for script_path in script_paths:
-        logger.debug(f"\tprocess: Applying script {script_path}.")
+        logger.debug(f"\tprocess: Applying script {script_path.name}.")
         ms.load_filter_script(str(script_path))
         ms.apply_filter_script()
 
@@ -421,7 +433,6 @@ def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
 def save(mesh: Union[Trimesh, pymeshlab.MeshSet, pymeshlab.Mesh, Dict[str, np.ndarray]],
          path: Path,
          precision: int = 32):
-    path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(mesh, Trimesh):
         if precision == 16:
             precision = np.float16
@@ -499,6 +510,7 @@ def run(in_path: Path, args: Any):
     if out_path.exists() and not args.overwrite:
         logger.debug(f"File {out_path} already exists. Skipping.")
         return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         restart = time()
@@ -508,13 +520,16 @@ def run(in_path: Path, args: Any):
         vertices = get_vertices_and_faces(mesh)[0]
         logger.debug(f"Loaded mesh ({len(vertices)} vertices) in {time() - restart:.2f}s.")
 
-        restart = time()
-        mesh, translation, scale = normalize(mesh, padding=args.padding)
-        logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
+        translation = np.zeros(3)
+        scale = 1.0
+        if not args.no_normalization:
+            restart = time()
+            mesh, translation, scale = normalize(mesh, padding=args.padding)
+            logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
 
         if args.mode == "fill":
             restart = time()
-            mesh = kaolin_pipeline(mesh)
+            mesh = kaolin_pipeline(mesh, save_voxel_path=out_path.parent / "voxel.npz")
             logger.debug(f"Ran Kaolin pipeline in {time() - restart:.2f}s.")
         elif args.mode == "fuse":
             restart = time()
@@ -556,8 +571,6 @@ def run(in_path: Path, args: Any):
                            return_type="trimesh" if args.use_trimesh else "dict")
         elif args.mode == "carve":
             raise NotImplementedError("Voxel carving is not implemented yet.")
-        else:
-            raise ValueError(f"Invalid mode: {args.mode}.")
 
         vertices, faces = get_vertices_and_faces(mesh)
         if len(vertices) == 0 or len(faces) == 0:
@@ -565,9 +578,10 @@ def run(in_path: Path, args: Any):
             return
         logger.debug(f"Extracted mesh ({len(vertices)} vertices, {len(faces)} faces) in {time() - restart:.2f}s.")
 
-        if args.script_dir:
+        if args.script_dir.is_dir():
             restart = time()
-            mesh = process(mesh, sorted(args.script_dir.expanduser().resolve().glob("*.mlx")))
+            scripts = load_scripts(args.script_dir, num_vertices=len(vertices))
+            mesh = process(mesh, scripts)
 
             vertices, faces = get_vertices_and_faces(mesh)
             if len(vertices) == 0 or len(faces) == 0:
@@ -575,9 +589,10 @@ def run(in_path: Path, args: Any):
                 return
             logger.debug(f"Filtered mesh ({len(vertices)} vertices, {len(faces)} faces) in {time() - restart:.2f}s.")
 
-        restart = time()
-        mesh, _, _ = normalize(mesh, translation=-translation * 1 / scale, scale=1 / scale)
-        logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
+        if not args.no_normalization:
+            restart = time()
+            mesh, _, _ = normalize(mesh, translation=-translation * 1 / scale, scale=1 / scale)
+            logger.debug(f"Normalized mesh in {time() - restart:.2f}s.")
 
         if args.check_watertight:
             restart = time()
@@ -621,15 +636,16 @@ def main():
                         help="Thicken object through offsetting of rendered depth maps.")
     parser.add_argument("--no_erosion", action="store_true",
                         help="Do not erode rendered depth maps to thicken thin structures.")
+    parser.add_argument("--no_normalization", action="store_true", help="Do not normalize the mesh.")
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of parallel jobs.")
     parser.add_argument("--n_views", type=int, default=100, help="Number of views to render.")
     parser.add_argument("--precision", type=int, default=16, choices=[16, 32, 64], help="Data precision.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files.")
     parser.add_argument("--flip_faces", action="store_true", help="Flip faces (i.e. invert normals) of the mesh.")
     parser.add_argument("--use_trimesh", action="store_true", help="Use trimesh for loading and saving meshes.")
-    parser.add_argument("--mode", type=str, default="fuse", choices=["fuse", "carve", "fill"],
-                        help="Apply TSDF fusion, voxel carving or hole filling to the meshes.")
-    parser.add_argument("--filter_only", action="store_true", help="Only applies the provided MeshLab filters.")
+    parser.add_argument("--mode", type=str, default="fuse", choices=["fuse", "carve", "fill", "script"],
+                        help="Apply TSDF fusion, voxel carving or hole filling to the meshes. Use 'script' to only"
+                             "apply MeshLab filter scripts from the provided 'script_dir'.")
     parser.add_argument("--sort", action="store_true", help="Sort files before processing.")
     parser.add_argument("--check_watertight", action="store_true", help="Verify that generated mesh is watertight.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
