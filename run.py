@@ -1,6 +1,5 @@
 import gc
 import os
-import sys
 from random import shuffle
 import tempfile
 
@@ -18,6 +17,7 @@ import tracemalloc
 import linecache
 
 import pymeshlab
+from pykdtree.kdtree import KDTree
 from tqdm import tqdm
 import trimesh
 from trimesh import Trimesh
@@ -193,40 +193,73 @@ def normalize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     return mesh, translation, scale
 
 
+def voxelize(mesh: Union[Trimesh, Dict[str, np.ndarray]],
+             min_value: float = -0.5,
+             max_value: float = 0.5,
+             resolution: int = 256) -> np.ndarray:
+    x = np.linspace(min_value, max_value, resolution)
+    xx, yy, zz = np.meshgrid(x, x, x, indexing='ij')
+    grid_points = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
+
+    vertices, faces = get_vertices_and_faces(mesh)
+    points = Trimesh(vertices=vertices, faces=faces).sample(resolution ** 3)
+
+    _, indices = KDTree(grid_points, leafsize=100).query(points)
+    voxel = np.zeros(len(grid_points), dtype=bool)
+    voxel[indices] = True
+
+    return voxel.reshape((resolution,) * 3)
+
+
 def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
                     resolution: int = 256,
+                    fill_holes: bool = True,
                     eps: float = 1e-6,
                     smoothing_iterations: int = 3,
                     realign: bool = True,
-                    save_voxel_path: Optional[Path] = None) -> Dict[str, np.ndarray]:
+                    save_voxel_path: Optional[Path] = None,
+                    try_cpu: bool = False) -> Dict[str, np.ndarray]:
     vertices, faces = get_vertices_and_faces(mesh)
     torch_vertices = torch.from_numpy(vertices).cuda()
     torch_faces = torch.from_numpy(faces).cuda()
 
-    voxel = kaolin.ops.conversions.trianglemeshes_to_voxelgrids(torch_vertices.unsqueeze(0),
-                                                                torch_faces,
-                                                                resolution=resolution,
-                                                                origin=torch.zeros((1, 3)).cuda() - 0.5,
-                                                                scale=torch.ones(1).cuda())
+    try:
+        voxel = kaolin.ops.conversions.trianglemeshes_to_voxelgrids(torch_vertices.unsqueeze(0),
+                                                                    torch_faces,
+                                                                    resolution=resolution,
+                                                                    origin=torch.zeros((1, 3)).cuda() - 0.5,
+                                                                    scale=torch.ones(1).cuda())
+    except torch.cuda.OutOfMemoryError as e:
+        if try_cpu:
+            logger.error("Out of memory error during voxelization on GPU. Trying CPU implementation.")
+            voxel = torch.from_numpy(voxelize(mesh, resolution=resolution)).unsqueeze(0).cuda()
+        else:
+            raise e
 
-    voxel = torch.from_numpy(ndimage.binary_fill_holes(voxel.squeeze(0).cpu().numpy())).unsqueeze(0).cuda()
+    if fill_holes:
+        voxel = torch.from_numpy(ndimage.binary_fill_holes(voxel.squeeze(0).cpu().numpy())).unsqueeze(0).cuda()
     voxel = kaolin.ops.voxelgrid.extract_surface(voxel)
     odms = kaolin.ops.voxelgrid.extract_odms(voxel)
     voxel = kaolin.ops.voxelgrid.project_odms(odms)
 
-    odms.cpu()
-    del odms
-    torch.cuda.empty_cache()
-
-    vertices, faces = kaolin.ops.conversions.voxelgrids_to_trianglemeshes(voxel)
-    vertices = vertices[0] / (voxel.size(-1) + 1)
-    vertices -= 0.5
-    faces = faces[0]
+    try:
+        vertices, faces = kaolin.ops.conversions.voxelgrids_to_trianglemeshes(voxel)
+        vertices = vertices[0] / (voxel.size(-1) + 1)
+        vertices -= 0.5
+        faces = faces[0]
+    except torch.cuda.OutOfMemoryError as e:
+        if try_cpu:
+            logger.error("Out of memory error during Marching Cubes on GPU. Trying CPU implementation.")
+            mesh = extract(voxel.squeeze(0).cpu().numpy(), level=0.5, resolution=resolution)
+            vertices, faces = get_vertices_and_faces(mesh)
+            vertices = torch.from_numpy(vertices).cuda()
+            faces = torch.from_numpy(faces).cuda()
+        else:
+            raise e
 
     voxel = voxel.squeeze(0).cpu().numpy()
     if save_voxel_path is not None:
         np.savez_compressed(str(save_voxel_path), voxel=np.packbits(voxel))
-    torch.cuda.empty_cache()
 
     if smoothing_iterations > 0:
         adj_sparse = kaolin.ops.mesh.adjacency_matrix(len(vertices), faces, sparse=True)
@@ -239,8 +272,6 @@ def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
         src_min, src_max = vertices.min(0, keepdim=True)[0], vertices.max(0, keepdim=True)[0]
         tgt_min, tgt_max = torch_vertices.min(0, keepdim=True)[0], torch_vertices.max(0, keepdim=True)[0]
         vertices = ((vertices - src_min) / (src_max - src_min + eps)) * (tgt_max - tgt_min) + tgt_min
-
-    torch.cuda.empty_cache()
 
     return {"vertices": vertices.cpu().numpy(), "faces": faces.cpu().numpy()}
 
@@ -350,10 +381,8 @@ def extract(grid: np.ndarray,
             level: float,
             resolution: int,
             return_type: str = "dict") -> Union[Trimesh, Dict[str, np.ndarray]]:
-    grid = np.pad(grid, 1, "constant", constant_values=-1e6 if grid.min() < 0 else 1e6)
     vertices, triangles = mcubes.marching_cubes(grid, level)
 
-    vertices -= 1  # Undo padding.
     vertices /= (resolution - 1)
     vertices -= 0.5
 
@@ -404,7 +433,7 @@ def get_vertices_and_faces(mesh: Union[Trimesh, Dict[str, np.ndarray]]) -> Tuple
         vertices, faces = mesh["vertices"], mesh["faces"]
     else:
         raise ValueError(f"Unknown mesh type '{type(mesh)}'.")
-    return vertices, faces
+    return vertices.astype(np.float32), faces.astype(np.int64)
 
 
 def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
@@ -529,7 +558,10 @@ def run(in_path: Path, args: Any):
 
         if args.mode == "fill":
             restart = time()
-            mesh = kaolin_pipeline(mesh, save_voxel_path=out_path.parent / "voxel.npz")
+            mesh = kaolin_pipeline(mesh,
+                                   resolution=args.resolution,
+                                   save_voxel_path=out_path.parent / "voxel.npz",
+                                   try_cpu=args.try_cpu)
             logger.debug(f"Ran Kaolin pipeline in {time() - restart:.2f}s.")
         elif args.mode == "fuse":
             restart = time()
@@ -648,6 +680,7 @@ def main():
                              "apply MeshLab filter scripts from the provided 'script_dir'.")
     parser.add_argument("--sort", action="store_true", help="Sort files before processing.")
     parser.add_argument("--check_watertight", action="store_true", help="Verify that generated mesh is watertight.")
+    parser.add_argument("--try_cpu", action="store_true", help="Fallback to CPU if GPU fails.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
 
