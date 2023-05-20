@@ -532,11 +532,36 @@ def trace_run(in_path: Path, args: Any):
     display_top(snapshot2)
 
 
+def check(out_path: Path, args: Any):
+    try:
+        mesh = load(out_path,
+                    loader="trimesh" if args.use_trimesh else "pymeshlab",
+                    return_type="trimesh" if args.use_trimesh else "dict")
+        vertices, faces = get_vertices_and_faces(mesh)
+        assert len(vertices) > 0 and len(faces) > 0, f"Mesh {out_path} is empty."
+        if args.check_watertight:
+            mesh = Trimesh(vertices=vertices, faces=faces, process=False, validate=False)
+            assert mesh.is_watertight, f"Mesh {out_path} is not watertight."
+    except Exception as e:
+        logger.exception(e)
+        if args.fix:
+            try:
+                os.remove(out_path)
+            except Exception as e:
+                logger.exception(e)
+                pass
+
+
 def run(in_path: Path, args: Any):
     start = time()
     logger.debug(f"Processing file {in_path}:")
 
     out_path = resolve_out_path(in_path, args.in_dir, args.out_format, args.out_dir)
+    if args.check:
+        check(out_path, args)
+        if not args.fix:
+            return
+
     if out_path.exists() and not args.overwrite:
         logger.debug(f"File {out_path} already exists. Skipping.")
         return
@@ -653,6 +678,7 @@ def main():
     parser.add_argument("--out_dir", type=Path, help="Path to output directory.")
     parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
     parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
+    parser.add_argument("--recursion_depth", type=int, default=-1, help="Depth of recursive glob pattern matching.")
     parser.add_argument("--script_dir", type=Path, default="meshlab_filter_scripts",
                         help="Path to directory containing MeshLab scripts.")
     parser.add_argument("--width", type=int, default=640, help="Width of the depth map.")
@@ -680,7 +706,9 @@ def main():
                         help="Apply TSDF fusion, voxel carving or hole filling to the meshes. Use 'script' to only"
                              "apply MeshLab filter scripts from the provided 'script_dir'.")
     parser.add_argument("--sort", action="store_true", help="Sort files before processing.")
+    parser.add_argument("--check", action="store_true", help="Check results.")
     parser.add_argument("--check_watertight", action="store_true", help="Verify that generated mesh is watertight.")
+    parser.add_argument("--fix", action="store_true", help="Fix results that failed check.")
     parser.add_argument("--try_cpu", action="store_true", help="Fallback to CPU if GPU fails.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     args = parser.parse_args()
@@ -692,7 +720,11 @@ def main():
 
     in_dir = args.in_dir.expanduser().resolve()
     logger.debug(f"Globbing paths from {in_dir}.")
-    files = list(in_dir.rglob(f"*{args.in_format}"))
+    if args.recursion_depth == -1:
+        files = list(in_dir.rglob(f"*{args.in_format}"))
+    else:
+        pattern = f"{'/'.join(['*' for _ in range(args.recursion_depth)])}/*{args.in_format}"
+        files = list(in_dir.glob(pattern))
     shuffle(files)
     if args.sort:
         files = sorted(files)
