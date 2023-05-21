@@ -250,7 +250,7 @@ def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
     except torch.cuda.OutOfMemoryError as e:
         if try_cpu:
             logger.error("Out of memory error during Marching Cubes on GPU. Trying CPU implementation.")
-            mesh = extract(voxel.squeeze(0).cpu().numpy(), level=0.5, resolution=resolution)
+            mesh = extract(voxel.squeeze(0).cpu().numpy(), level=0.5, resolution=resolution, pad=False)
             vertices, faces = get_vertices_and_faces(mesh)
             vertices = torch.from_numpy(vertices).cuda()
             faces = torch.from_numpy(faces).cuda()
@@ -380,9 +380,13 @@ def fuse(depthmaps: List[np.ndarray],
 def extract(grid: np.ndarray,
             level: float,
             resolution: int,
+            pad: bool = True,
             return_type: str = "dict") -> Union[Trimesh, Dict[str, np.ndarray]]:
+    if pad:
+        grid = np.pad(grid, 1, "constant", constant_values=-1e6)
     vertices, triangles = mcubes.marching_cubes(grid, level)
-
+    if pad:
+        vertices -= 1
     vertices /= (resolution - 1)
     vertices -= 0.5
 
@@ -401,7 +405,7 @@ def load_scripts(script_dir: Path,
                  num_vertices: Optional[int] = None,
                  min_vertices: int = 20000,
                  max_vertices: int = 200000) -> List[Path]:
-    scripts = sorted(script_dir.expanduser().resolve().glob("*.mlx"))
+    scripts = sorted(script_dir.glob("*.mlx"))
     logger.debug(f"Found {len(scripts)} scripts in {script_dir}.")
     simplify = any(script.name == 'simplify.mlx' for script in scripts)
     if simplify and num_vertices is not None:
@@ -636,9 +640,11 @@ def run(in_path: Path, args: Any):
             return
         logger.debug(f"Extracted mesh ({len(vertices)} vertices, {len(faces)} faces) in {time() - restart:.2f}s.")
 
-        if args.script_dir.is_dir():
+        if args.script_dir is not None:
             restart = time()
-            scripts = load_scripts(args.script_dir, num_vertices=len(vertices))
+            script_dir = args.script_dir.expanduser().resolve()
+            assert script_dir.is_dir(), f"Script dir {script_dir} is not a directory."
+            scripts = load_scripts(script_dir, num_vertices=len(vertices))
             mesh = process(mesh, scripts)
 
             vertices, faces = get_vertices_and_faces(mesh)

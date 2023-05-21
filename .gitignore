@@ -8,3 +8,4 @@ librender/pyrender.cpp
 libmcubes/mcubes.cpp
 .idea
 .python-version
+*.sh
