@@ -259,6 +259,7 @@ def kaolin_pipeline(mesh: Union[Trimesh, Dict[str, np.ndarray]],
 
     voxel = voxel.squeeze(0).cpu().numpy()
     if save_voxel_path is not None:
+        save_voxel_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(str(save_voxel_path), voxel=np.packbits(voxel))
 
     if smoothing_iterations > 0:
@@ -467,6 +468,7 @@ def process(mesh: Union[Trimesh, Dict[str, np.ndarray]],
 def save(mesh: Union[Trimesh, pymeshlab.MeshSet, pymeshlab.Mesh, Dict[str, np.ndarray]],
          path: Path,
          precision: int = 32):
+    path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(mesh, Trimesh):
         if precision == 16:
             precision = np.float16
@@ -569,7 +571,6 @@ def run(in_path: Path, args: Any):
     if out_path.exists() and not args.overwrite:
         logger.debug(f"File {out_path} already exists. Skipping.")
         return
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         restart = time()
