@@ -685,7 +685,7 @@ def main():
     parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
     parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
     parser.add_argument("--recursion_depth", type=int, default=-1, help="Depth of recursive glob pattern matching.")
-    parser.add_argument("--script_dir", type=Path, default="meshlab_filter_scripts",
+    parser.add_argument("--script_dir", type=Path, default="./meshlab_filter_scripts",
                         help="Path to directory containing MeshLab scripts.")
     parser.add_argument("--width", type=int, default=640, help="Width of the depth map.")
     parser.add_argument("--height", type=int, default=640, help="Height of the depth map.")
