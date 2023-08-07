@@ -2,6 +2,7 @@ import gc
 import os
 from random import shuffle
 import tempfile
+from functools import partial
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
@@ -490,11 +491,34 @@ def save(mesh: Union[Trimesh, pymeshlab.MeshSet, pymeshlab.Mesh, Dict[str, np.nd
             ms.add_mesh(pymesh)
         else:
             ms = mesh
-        ms.save_current_mesh(file_name=str(path),
-                             save_vertex_color=False,
-                             save_vertex_coord=False,
-                             save_face_color=False,
-                             save_polygonal=True)
+
+        save_current_mesh = partial(ms.save_current_mesh, save_textures=False)
+        if path.suffix == ".stl":
+            save_current_mesh = partial(save_current_mesh,
+                                        binary=True,
+                                        save_face_color=False)
+        if path.suffix in [".off", ".ply", ".obj"]:
+            save_current_mesh = partial(save_current_mesh,
+                                        save_vertex_color=False,
+                                        save_vertex_coord=False,
+                                        save_face_color=False,
+                                        save_polygonal=False)
+        if path.suffix == ".ply":
+            save_current_mesh = partial(save_current_mesh,
+                                        binary=True,
+                                        save_vertex_quality=False,
+                                        save_vertex_normal=False,
+                                        save_vertex_radius=False,
+                                        save_face_quality=False,
+                                        save_wedge_color=False,
+                                        save_wedge_texcoord=False,
+                                        save_wedge_normal=False)
+        elif path.suffix == ".obj":
+            save_current_mesh = partial(save_current_mesh,
+                                        save_vertex_normal=False,
+                                        save_wedge_texcoord=False,
+                                        save_wedge_normal=False)
+        save_current_mesh(file_name=str(path))
     else:
         raise ValueError(f"Unsupported mesh type '{type(mesh)}'.")
 
@@ -664,7 +688,7 @@ def run(in_path: Path, args: Any):
             vertices, faces = get_vertices_and_faces(mesh)
             _mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
             if not _mesh.is_watertight:
-                logger.warning(f"Mesh is not watertight. Skipping.")
+                logger.warning(f"Mesh {in_path} is not watertight. Skipping.")
                 return
             logger.debug(f"Checked watertightness in {time() - restart:.2f}s.")
 
@@ -684,7 +708,8 @@ def main():
     parser.add_argument("in_dir", type=Path, help="Path to input directory.")
     parser.add_argument("--out_dir", type=Path, help="Path to output directory.")
     parser.add_argument("--in_format", type=str, default=".obj", help="Input file format.")
-    parser.add_argument("--out_format", type=str, default=".off", help="Output file format.")
+    parser.add_argument("--out_format", type=str, default=".off", choices=[".obj", ".off", ".ply", ".stl"],
+                        help="Output file format.")
     parser.add_argument("--recursion_depth", type=int, default=-1, help="Depth of recursive glob pattern matching.")
     parser.add_argument("--script_dir", type=Path, default="./meshlab_filter_scripts",
                         help="Path to directory containing MeshLab scripts.")
